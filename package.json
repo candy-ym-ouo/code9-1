@@ -1,0 +1,37 @@
+{
+  "name": "film-location-inspiration-library",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "电影取景灵感库 - 收藏现实中的光线/建筑/色彩/构图，记录适合拍摄的时间与天气，做地点模糊化与主题画册",
+  "engines": {
+    "node": ">=20.11.0"
+  },
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "dev": "concurrently -n server,web -c blue,magenta \"npm:dev:server\" \"npm:dev:web\"",
+    "dev:server": "npm --workspace @flil/server run dev",
+    "dev:web": "npm --workspace @flil/web run dev",
+    "build": "npm --workspace @flil/web run build",
+    "start": "npm --workspace @flil/server run start",
+    "db:migrate": "npm --workspace @flil/server run db:migrate",
+    "db:seed": "npm --workspace @flil/server run db:seed",
+    "db:reset": "npm --workspace @flil/server run db:reset",
+    "job:scan-windows": "npm --workspace @flil/server run job:scan-windows",
+    "job:dispatch": "npm --workspace @flil/server run job:dispatch",
+    "backup": "npm --workspace @flil/server run backup",
+    "export:json": "npm --workspace @flil/server run export:json",
+    "smoke": "node apps/server/scripts/smoke.mjs http://localhost:3000",
+    "test": "npm --workspace @flil/server run test",
+    "test:e2e": "npm --workspace @flil/web run test:e2e",
+    "typecheck": "npm --workspace @flil/shared run typecheck && npm --workspace @flil/server run typecheck && npm --workspace @flil/web run typecheck",
+    "setup": "npm install && npm run db:migrate && npm run db:seed"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2",
+    "typescript": "^5.7.3"
+  }
+}
