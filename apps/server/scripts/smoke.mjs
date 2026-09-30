@@ -312,6 +312,103 @@ async function main() {
   const afterRevoke = await req('GET', `/share/${shareToken}?password=2468`, undefined, { noAuth: true });
   check('撤销后旧链接立即失效', afterRevoke.status === 401 && afterRevoke.json?.error?.code === 'SHARE_REVOKED');
 
+  // 15b. 邀请 / 角色调整：即时失效、幂等、最后所有者保护
+  const inviteEmail = `smoke-invite-${Date.now()}@flil.local`;
+  const inviteeReg = await req('POST', '/auth/register', {
+    email: inviteEmail,
+    password: 'password123',
+    displayName: '被邀请人',
+  });
+  const inviteeTokenBefore = inviteeReg.json?.token;
+
+  token = ownerToken;
+  const createdInvite = await req('POST', '/library/invites', { email: inviteEmail, role: 'member' });
+  check('创建邀请返回接受链接', createdInvite.status === 201 && typeof createdInvite.json?.token === 'string');
+  const inviteToken = createdInvite.json?.token;
+
+  const dupInvite = await req('POST', '/library/invites', { email: inviteEmail, role: 'member' });
+  check('重复邀请复用旧链接（reused）', dupInvite.status === 200 && dupInvite.json?.reused === true && dupInvite.json?.token === inviteToken);
+
+  // 被邀请人（当前 JWT 指向自己注册的库）可预览、可接受
+  token = inviteeTokenBefore;
+  const invitePreview = await req('GET', `/invites/${inviteToken}`);
+  check('接受前可预览邀请', invitePreview.status === 200 && invitePreview.json?.matchesCurrentUser === true);
+
+  const accept1 = await req('POST', `/invites/${inviteToken}/accept`, {});
+  check('首次接受成功并拿到新库 token', accept1.status === 200 && typeof accept1.json?.token === 'string');
+  const inviteeTokenInLib = accept1.json?.token;
+
+  const accept2 = await req('POST', `/invites/${inviteToken}/accept`, {});
+  check('重复接受幂等（alreadyJoined，不建双关系）', accept2.status === 200 && accept2.json?.alreadyJoined === true);
+
+  token = ownerToken;
+  const libAfterAccept = await req('GET', '/library');
+  check(
+    '成员关系只有一条',
+    (libAfterAccept.json?.members ?? []).filter((m) => m.email === inviteEmail).length === 1,
+  );
+
+  // 被邀请人在新库里：精确坐标不可见
+  token = inviteeTokenInLib;
+  const memberSpot = await req('GET', `/spots/${spot.json.id}`);
+  check('新成员拿不到精确坐标', memberSpot.status === 200 && memberSpot.json?.item?.precise === null);
+
+  // 提升为 owner：旧 token 下一请求即可见精确坐标（即时生效）
+  token = ownerToken;
+  const inviteeId = (libAfterAccept.json?.members ?? []).find((m) => m.email === inviteEmail)?.id;
+  const promote = await req('PATCH', `/library/members/${inviteeId}/role`, { role: 'owner' });
+  check('提升为所有者', promote.status === 200);
+  token = inviteeTokenInLib;
+  const promotedSpot = await req('GET', `/spots/${spot.json.id}`);
+  check('提权即时生效：可立即看到精确坐标', promotedSpot.json?.item?.precise?.lat === 31.2471);
+
+  // 该 owner 建一条分享，随后降级 → 历史分享必须立即撤销
+  const ownerShare = await req('POST', '/share-links', {
+    scope: 'inspiration',
+    scopeId: cardId,
+    fuzzLevel: 'g500',
+    expiresInDays: 1,
+  });
+  const ownerShareToken = ownerShare.json?.token;
+  token = ownerToken;
+  const demote = await req('PATCH', `/library/members/${inviteeId}/role`, { role: 'member' });
+  check('降级返回被撤销的历史分享数', demote.status === 200 && (demote.json?.revokedShareCount ?? 0) >= 1);
+  const shareAfterDemote = await req('GET', `/share/${ownerShareToken}`, undefined, { noAuth: true });
+  check('降级后历史分享立即失效', shareAfterDemote.status === 401 && shareAfterDemote.json?.error?.code === 'SHARE_REVOKED');
+  token = inviteeTokenInLib;
+  const demotedSpot = await req('GET', `/spots/${spot.json.id}`);
+  check('降级即时收回精确坐标', demotedSpot.status === 200 && demotedSpot.json?.item?.precise === null);
+
+  // 最后所有者保护
+  token = ownerToken;
+  const ownerId = (await req('GET', '/library')).json.members.find((m) => m.email === email)?.id;
+  const demoteLast = await req('PATCH', `/library/members/${ownerId}/role`, { role: 'member' });
+  check('最后一个所有者不可降级', demoteLast.status === 409 && demoteLast.json?.error?.code === 'LAST_OWNER_PROTECTED');
+  const removeLast = await req('DELETE', `/library/members/${ownerId}`);
+  check('最后一个所有者不可移除', removeLast.status === 409 && removeLast.json?.error?.code === 'LAST_OWNER_PROTECTED');
+
+  // 移除成员：旧 JWT 立即 401
+  const removeMemberRes = await req('DELETE', `/library/members/${inviteeId}`);
+  check('移除普通成员成功', removeMemberRes.status === 200);
+  token = inviteeTokenInLib;
+  const afterRemove = await req('GET', `/spots/${spot.json.id}`);
+  check('被移除者的旧 token 立即失权（401）', afterRemove.status === 401);
+
+  // 撤销邀请后不可接受
+  token = ownerToken;
+  const invite2Email = `smoke-invite2-${Date.now()}@flil.local`;
+  await req('POST', '/auth/register', { email: invite2Email, password: 'password123', displayName: '第二人' });
+  const inv2 = await req('POST', '/library/invites', { email: invite2Email, role: 'member' });
+  const revokeInviteRes = await req('DELETE', `/library/invites/${inv2.json?.id}`);
+  check('撤销邀请', revokeInviteRes.status === 200);
+  // 第二人登录
+  const login2 = await req('POST', '/auth/login', { email: invite2Email, password: 'password123' });
+  token = login2.json?.token;
+  const acceptRevoked = await req('POST', `/invites/${inv2.json?.token}/accept`, {});
+  check('撤销的邀请不可接受（410）', acceptRevoked.status === 410 && acceptRevoked.json?.error?.code === 'INVITE_REVOKED');
+
+  token = ownerToken;
+
   // 16. 检索 + 零结果兜底
   const searchHit = await req('GET', `/search?tagIds=${tIds['逆光']}`);
   check('按标签检索命中', (searchHit.json?.total ?? 0) >= 1, String(searchHit.json?.total));

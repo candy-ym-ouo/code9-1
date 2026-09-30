@@ -43,8 +43,8 @@ npm start          # 后端 3000 端口同时托管前端，SPA fallback 已配�
 ## 验证（这三条命令就是"真的能跑"的证明）
 
 ```bash
-npm test                        # 76 个自动化测试：天文 / 几何 / geohash / 窗口判定 / API 闭环
-npm run smoke                   # 69 项真实 HTTP 断言（需先启动服务端）
+npm test                        # 90 个自动化测试：天文 / 几何 / geohash / 窗口判定 / API 闭环（含成员邀请与角色调整）
+npm run smoke                   # 86 项真实 HTTP 断言（需先启动服务端）
 npm run test:e2e                # 2 个真实浏览器闭环用例（需先 npm run build && npm start）
 ```
 
@@ -121,6 +121,12 @@ origin/
 - 精确坐标**只存在你本机**（SQLite 的 `spot.lat/lng`），且只有 owner 能看到。
 - 图片的 EXIF GPS **默认不入库**，只记录"这张图含 GPS"的标记位并提示你。
 - 分享链接必带过期时间，可设密码，可随时撤销（**撤销即时生效**，图片令牌同步失效）。
+- **成员邀请与角色调整牵动历史分享与精确坐标，变更即时失效**：
+  - 邀请走带 token 的接受链接（`POST /library/invites` → `/invite/:token`），默认 `INVITE_TTL_DAYS=14` 天过期，owner 可随时撤销（撤销后下一次接受即 410）。
+  - 鉴权**每个请求都回查成员表**，JWT 里的角色只是登录快照——成员被移除则旧 token 当场 401，被降级则下一请求立刻只能看到模糊坐标，无需等待重登。
+  - 成员被**移除**、或从 owner **降为 member** 时，他历史上以 owner 身份开过的、仍有效的分享链接（含图片令牌）被**一并撤销**，下一次访问即 `SHARE_REVOKED`。member→owner 是授权扩大，不牵动历史分享。
+  - **接受邀请幂等**：重复点击接受 / 已是成员时返回 `alreadyJoined`，绝不建立第二条成员关系（`UNIQUE(library_id,user_id)` 兜底）。
+  - **最后一名所有者不可移除、也不可降级**（`LAST_OWNER_PROTECTED`，409）——库必须始终有一个能管理并看到精确坐标的人。
 - 分享图会另存一份并剥离全部 EXIF；分享页不展示距离向量，避免三角定位。
 - 备份：`npm run backup`（SQLite 快照 + 图片目录），保留最近 14 份；还原前会自动备份当前状态。
 
@@ -137,6 +143,8 @@ origin/
 | `WEATHER_PROVIDER` | `open-meteo` | 可设为 `off`（纯天文降级）或 `fixture`（自动化测试用） |
 | `VITE_MAP_TILE_URL` / `MAP_TILE_URL` | OSM | 瓦片源模板 |
 | `DEFAULT_FUZZ_LEVEL` | `g500` | 对外默认模糊级别（不允许设为精确） |
+| `SHARE_MAX_EXPIRE_DAYS` | `180` | 单条分享链接最长有效期（天） |
+| `INVITE_TTL_DAYS` | `14` | 成员邀请链接有效期（天），过期后接受返回 410 |
 | `WINDOW_FORECAST_DAYS` | `7` | 窗口预计算天数 |
 
 ---

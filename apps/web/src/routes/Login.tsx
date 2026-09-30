@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import { Alert, Button, Card, Form, Input, Space, Tabs, Typography, message } from 'antd';
 import type { AuthUser } from '@flil/shared';
 import { post } from '../api/client.js';
@@ -10,6 +10,10 @@ export default function Login() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const navigate = useNavigate();
+  const [params] = useSearchParams();
+  // 仅允许站内相对路径跳转，避免 open redirect
+  const nextParam = params.get('next');
+  const next = nextParam && nextParam.startsWith('/') && !nextParam.startsWith('//') ? nextParam : '/';
   const setSession = useSession((s) => s.setSession);
 
   async function submit(values: { email: string; password: string; displayName?: string; libraryName?: string }) {
@@ -22,7 +26,7 @@ export default function Login() {
           : await post<{ token: string; user: AuthUser }>('/auth/register', values);
       setSession(res.token, res.user);
       message.success(mode === 'login' ? '已登录' : '已创建你的灵感库');
-      navigate('/');
+      navigate(next);
     } catch (err) {
       setError((err as Error).message);
     } finally {

@@ -7,6 +7,7 @@ import {
   Descriptions,
   Form,
   Input,
+  Popconfirm,
   Select,
   Space,
   Table,
@@ -16,9 +17,247 @@ import {
   message,
 } from 'antd';
 import { get, patch, post } from '../api/client.js';
-import { useReminders, useRevokeShare, useShareLinks, useTags } from '../api/hooks.js';
+import {
+  useInviteMember,
+  useLibraryInfo,
+  useReminders,
+  useRemoveMember,
+  useRevokeInvite,
+  useRevokeShare,
+  useSetMemberRole,
+  useShareLinks,
+  useTags,
+  type LibraryInvite,
+  type LibraryMember,
+} from '../api/hooks.js';
 import { FUZZ_LABEL, fmtDateTime } from '../lib/format.js';
 import { useSession } from '../stores/session.js';
+
+function MembersTab() {
+  const { data, refetch } = useLibraryInfo();
+  const inviteApi = useInviteMember();
+  const revokeInvite = useRevokeInvite();
+  const changeRoleApi = useSetMemberRole();
+  const removeMember = useRemoveMember();
+  const session = useSession();
+  const [email, setEmail] = useState('');
+  const [inviteRole, setInviteRole] = useState<'owner' | 'member'>('member');
+  const [busyId, setBusyId] = useState<string | null>(null);
+
+  const members = data?.members ?? [];
+  const invites = data?.invites ?? [];
+  const ownerCount = members.filter((m) => m.role === 'owner').length;
+  const currentUserId = session.user?.id;
+
+  async function sendInvite() {
+    if (!email.trim()) return;
+    try {
+      const res = await inviteApi.mutateAsync({ email: email.trim(), role: inviteRole });
+      const link = `${window.location.origin}${res.acceptUrl}`;
+      setEmail('');
+      message.success({ content: res.reused ? '该邀请已存在，已复制原链接' : '邀请已创建，链接已复制', duration: 3 });
+      try {
+        await navigator.clipboard.writeText(link);
+      } catch {
+        /* 剪贴板不可用时静默 */
+      }
+    } catch (err) {
+      message.error((err as Error).message);
+    }
+  }
+
+  async function copyInviteLink(inv: LibraryInvite) {
+    try {
+      await navigator.clipboard.writeText(`${window.location.origin}/invite/${inv.token}`);
+      message.success('邀请链接已复制');
+    } catch {
+      message.error('复制失败，请手动复制');
+    }
+  }
+
+  async function changeRole(m: LibraryMember, next: 'owner' | 'member') {
+    setBusyId(m.id);
+    try {
+      const res = await changeRoleApi.mutateAsync({ userId: m.id, role: next });
+      message.success(
+        next === 'member' && res.revokedShareCount > 0
+          ? `已降为协作者，其 ${res.revokedShareCount} 条历史分享已即时失效`
+          : '角色已调整，权限即时生效',
+      );
+    } catch (err) {
+      message.error((err as Error).message);
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function remove(m: LibraryMember) {
+    setBusyId(m.id);
+    try {
+      const res = await removeMember.mutateAsync(m.id);
+      message.success(
+        res.revokedShareCount > 0
+          ? `已移除，其旧登录与 ${res.revokedShareCount} 条历史分享即时失效`
+          : '已移除，其旧登录立即失权',
+      );
+    } catch (err) {
+      message.error((err as Error).message);
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  return (
+    <Space direction="vertical" style={{ width: '100%' }} size={16}>
+      <Card
+        title="邀请成员"
+        extra={
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            被邀请人通过邮件中的链接接受；移除/降级即时收回权限
+          </Typography.Text>
+        }
+      >
+        <Space wrap>
+          <Input
+            placeholder="被邀请人邮箱（需已注册）"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+            style={{ width: 280 }}
+          />
+          <Select
+            value={inviteRole}
+            onChange={setInviteRole}
+            style={{ width: 200 }}
+            options={[
+              { value: 'member', label: '协作者（仅见模糊坐标）' },
+              { value: 'owner', label: '所有者（可见精确坐标）' },
+            ]}
+          />
+          <Button type="primary" loading={inviteApi.isPending} onClick={sendInvite}>
+            生成邀请链接
+          </Button>
+        </Space>
+        <Alert
+          style={{ marginTop: 12 }}
+          type="info"
+          showIcon
+          message="同一邮箱重复邀请会复用原链接；邀请接受是幂等的，重复点击接受不会产生第二条成员关系。"
+        />
+      </Card>
+
+      <Card title={`成员（${members.length}）`}>
+        <Table
+          size="small"
+          rowKey="id"
+          pagination={false}
+          dataSource={members}
+          columns={[
+            { title: '昵称', dataIndex: 'displayName' },
+            { title: '邮箱', dataIndex: 'email' },
+            {
+              title: '角色',
+              dataIndex: 'role',
+              width: 110,
+              render: (v: string) =>
+                v === 'owner' ? <Tag color="gold">所有者</Tag> : <Tag color="blue">协作者</Tag>,
+            },
+            {
+              title: '操作',
+              width: 260,
+              render: (_, m) => {
+                const isSelf = m.id === currentUserId;
+                const isLastOwner = m.role === 'owner' && ownerCount <= 1;
+                const disableOwnerAction = isSelf || isLastOwner;
+                return (
+                  <Space>
+                    {m.role === 'member' ? (
+                      <Button size="small" disabled={isSelf} loading={busyId === m.id} onClick={() => changeRole(m, 'owner')}>
+                        设为所有者
+                      </Button>
+                    ) : (
+                      <Button
+                        size="small"
+                        disabled={disableOwnerAction}
+                        loading={busyId === m.id}
+                        title={isLastOwner ? '至少保留一名所有者' : isSelf ? '不能调整自己' : undefined}
+                        onClick={() => changeRole(m, 'member')}
+                      >
+                        降为协作者
+                      </Button>
+                    )}
+                    <Popconfirm
+                      title={isLastOwner ? '最后一名所有者不可移除' : `移除 ${m.displayName}？`}
+                      description={!isLastOwner ? '其旧登录立即失权，历史有效分享一并撤销。' : undefined}
+                      disabled={disableOwnerAction}
+                      onConfirm={() => remove(m)}
+                    >
+                      <Button size="small" danger disabled={disableOwnerAction} loading={busyId === m.id}>
+                        移除
+                      </Button>
+                    </Popconfirm>
+                  </Space>
+                );
+              },
+            },
+          ]}
+        />
+        <Alert
+          style={{ marginTop: 12 }}
+          type="warning"
+          showIcon
+          message="库必须始终至少有一名所有者：最后一名所有者不可移除、也不可降级。"
+        />
+      </Card>
+
+      <Card title={`邀请记录（${invites.length}）`}>
+        <Table
+          size="small"
+          rowKey="id"
+          pagination={false}
+          dataSource={invites}
+          columns={[
+            { title: '邮箱', dataIndex: 'email' },
+            {
+              title: '角色',
+              dataIndex: 'role',
+              width: 100,
+              render: (v: string) => (v === 'owner' ? <Tag color="gold">所有者</Tag> : <Tag color="blue">协作者</Tag>),
+            },
+            {
+              title: '状态',
+              dataIndex: 'status',
+              width: 100,
+              render: (v: string) => {
+                const color = v === 'pending' ? 'processing' : v === 'accepted' ? 'success' : 'default';
+                return <Tag color={color}>{v === 'pending' ? '待接受' : v === 'accepted' ? '已接受' : v === 'revoked' ? '已撤销' : '已过期'}</Tag>;
+              },
+            },
+            { title: '过期', width: 170, render: (_, i: LibraryInvite) => fmtDateTime(i.expiresAt, useSession.getState().libraryTz) },
+            {
+              title: '操作',
+              width: 180,
+              render: (_, i: LibraryInvite) =>
+                i.status === 'pending' ? (
+                  <Space>
+                    <Button size="small" onClick={() => copyInviteLink(i)}>
+                      复制链接
+                    </Button>
+                    <Popconfirm title="撤销该邀请？撤销后链接立即无法接受。" onConfirm={() => revokeInvite.mutate(i.id)}>
+                      <Button size="small" danger>
+                        撤销
+                      </Button>
+                    </Popconfirm>
+                  </Space>
+                ) : (
+                  <Typography.Text type="secondary">—</Typography.Text>
+                ),
+            },
+          ]}
+        />
+      </Card>
+    </Space>
+  );
+}
 
 export default function Settings() {
   const qc = useQueryClient();
@@ -85,6 +324,18 @@ export default function Settings() {
               </Form>
             </Card>
           ),
+        },
+        {
+          key: 'members',
+          label: '成员与邀请',
+          children:
+            useSession.getState().user?.role === 'owner' ? (
+              <MembersTab />
+            ) : (
+              <Card>
+                <Alert type="info" showIcon message="成员与邀请管理仅库所有者可见。" />
+              </Card>
+            ),
         },
         {
           key: 'tags',

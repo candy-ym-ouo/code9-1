@@ -2,6 +2,7 @@ import type { NextFunction, Request, Response } from 'express';
 import crypto from 'node:crypto';
 import jwt from 'jsonwebtoken';
 import { config } from '../config.js';
+import { getDb } from '../db.js';
 import { errors } from './errors.js';
 import { logger } from '../logger.js';
 import { fail } from './respond.js';
@@ -57,7 +58,15 @@ export function authenticate(required = true) {
       return;
     }
     try {
-      req.auth = jwt.verify(token, config.jwtSecret) as JwtPayload;
+      const payload = jwt.verify(token, config.jwtSecret) as JwtPayload;
+      // 即时失效（成员邀请/角色调整第一不变量）：JWT 里的 role/libraryId 只是登录时的快照，
+      // 不能据此放行。每个请求都回查成员表——被移除则立即 401（旧 token 当场作废），
+      // 被降级则立即按 member 处理（精确坐标出口 toSpotDto 随之只给模糊点）。
+      const member = getDb()
+        .prepare('SELECT role FROM library_member WHERE library_id = ? AND user_id = ?')
+        .get(payload.libraryId, payload.id) as { role: 'owner' | 'member' } | undefined;
+      if (!member) throw new Error('membership revoked');
+      req.auth = { ...payload, role: member.role };
       next();
     } catch {
       if (required) {

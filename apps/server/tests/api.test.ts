@@ -417,6 +417,247 @@ describe('E9 离线补录幂等', () => {
   });
 });
 
+describe('E11 成员邀请与角色调整（即时失效 / 幂等 / 最后所有者保护）', () => {
+  let ownerToken = '';
+  let memberEmail = '';
+  let memberId = '';
+  let memberToken = '';
+  let inviteToken = '';
+
+  async function login(email: string, password = 'password123') {
+    const res = await request(app)
+      .post('/api/auth/login')
+      .send({ email, password });
+    return res.body as { token: string; user: { id: string } };
+  }
+
+  function auth(t: string) {
+    token = t;
+  }
+
+  it('owner 发出邀请，未注册/已注册用户都拿到 acceptUrl', async () => {
+    // 自包含登录（本 describe 单独运行时 E1 的注册副作用不一定已执行）
+    let loginRes = await login('owner@test.local').catch(() => null);
+    if (!loginRes?.token) {
+      const reg = await request(app)
+        .post('/api/auth/register')
+        .send({ email: 'owner@test.local', password: 'password123', displayName: '测试所有者' });
+      loginRes = reg.body as { token: string; user: { id: string } };
+    }
+    ownerToken = loginRes.token;
+    memberEmail = `invitee-${Date.now()}@test.local`;
+    // 先注册该用户（模拟"被邀请人已注册但不在库中"）
+    await request(app)
+      .post('/api/auth/register')
+      .send({ email: memberEmail, password: 'password123', displayName: '被邀请人' });
+    const loginResult = await login(memberEmail);
+    memberId = loginResult.user.id;
+    memberToken = loginResult.token;
+
+    auth(ownerToken);
+    const res = await call('post', '/api/library/invites', { email: memberEmail, role: 'member' });
+    expect(res.status).toBe(201);
+    expect(res.body.acceptUrl).toContain('/invite/');
+    inviteToken = res.body.token;
+  });
+
+  it('同一邮箱重复邀请复用旧链接（不造第二条邀请）', async () => {
+    auth(ownerToken);
+    const again = await call('post', '/api/library/invites', { email: memberEmail, role: 'member' });
+    expect(again.status).toBe(200);
+    expect(again.body.reused).toBe(true);
+    expect(again.body.token).toBe(inviteToken);
+  });
+
+  it('接受前可用 token 预览库名与角色', async () => {
+    auth(memberToken);
+    const preview = await call('get', `/api/invites/${inviteToken}`);
+    expect(preview.status).toBe(200);
+    expect(preview.body.role).toBe('member');
+    expect(preview.body.matchesCurrentUser).toBe(true);
+  });
+
+  it('用错误账号接受被拒（邮箱不匹配）', async () => {
+    const other = await request(app)
+      .post('/api/auth/register')
+      .send({ email: `other-${Date.now()}@test.local`, password: 'password123', displayName: '路人' });
+    auth(other.body.token);
+    const denied = await call('post', `/api/invites/${inviteToken}/accept`, {});
+    expect(denied.status).toBe(403);
+    expect(denied.body.error.code).toBe('INVITE_EMAIL_MISMATCH');
+  });
+
+  it('接受邀请成功并拿到指向该库的新 token', async () => {
+    auth(memberToken);
+    const res = await call('post', `/api/invites/${inviteToken}/accept`, {});
+    expect(res.status).toBe(200);
+    expect(res.body.alreadyJoined).toBe(false);
+    memberToken = res.body.token;
+  });
+
+  it('重复接受幂等：不建第二条关系', async () => {
+    auth(memberToken);
+    const again = await call('post', `/api/invites/${inviteToken}/accept`, {});
+    expect(again.status).toBe(200);
+    expect(again.body.alreadyJoined).toBe(true);
+
+    // 数据库层兜底：成员关系只有一条
+    auth(ownerToken);
+    const lib = await call('get', '/api/library');
+    const rows = (lib.body.members as { email: string }[]).filter((m) => m.email === memberEmail);
+    expect(rows).toHaveLength(1);
+  });
+
+  it('member 读卡片拿不到精确坐标', async () => {
+    auth(memberToken);
+    const detail = await call('get', `/api/inspirations/${cardId}`);
+    expect(detail.body.item.spot.precise).toBeNull();
+    const precise = await call('get', `/api/spots/${spotId}`);
+    expect(precise.body.item.precise).toBeNull();
+  });
+
+  it('member 可建分享（分享层只给模糊坐标），其链接用于后续移除/降级验证', async () => {
+    auth(memberToken);
+    const created = await call('post', '/api/inspirations', { title: '协作者的卡' });
+    const memberCardId = created.body.id as string;
+    const link = await call('post', '/api/share-links', {
+      scope: 'inspiration',
+      scopeId: memberCardId,
+      fuzzLevel: 'g500',
+      expiresInDays: 1,
+    });
+    expect(link.status).toBe(201);
+    (globalThis as Record<string, unknown>).__memberShareToken = link.body.token;
+    (globalThis as Record<string, unknown>).__memberCardId = memberCardId;
+
+    // 分享页公开可访问，且只有模糊坐标
+    token = '';
+    const view = await call('get', `/api/share/${link.body.token as string}`);
+    expect(view.status).toBe(200);
+    expect(JSON.stringify(view.body)).not.toContain('"precise"');
+    auth(ownerToken);
+  });
+
+  it('降级 member（已是 member，无需降级）→ 直接测移除：旧 token 立即 401 且历史分享撤销', async () => {
+    // 先把 member 提升为 owner（授权扩大，不撤销分享）
+    auth(ownerToken);
+    const promote = await call('patch', `/api/library/members/${memberId}/role`, { role: 'owner' });
+    expect(promote.status).toBe(200);
+
+    // 提权即时生效：旧 memberToken 在下一请求即具备 owner 能力（精确坐标）
+    auth(memberToken);
+    const asOwner = await call('get', `/api/spots/${spotId}`);
+    expect(asOwner.body.item.precise?.lat).toBe(31.2471);
+
+    // owner 身份建一条分享，用于验证降级后被撤销
+    const link = await call('post', '/api/share-links', {
+      scope: 'inspiration',
+      scopeId: cardId,
+      fuzzLevel: 'g500',
+      expiresInDays: 1,
+    });
+    expect(link.status).toBe(201);
+    const ownerShareToken = link.body.token as string;
+
+    // 降回 member：服务端撤销其有效分享，并即时收回精确坐标
+    auth(ownerToken);
+    const demote = await call('patch', `/api/library/members/${memberId}/role`, { role: 'member' });
+    expect(demote.status).toBe(200);
+    expect(demote.body.revokedShareCount).toBeGreaterThanOrEqual(1);
+
+    auth(memberToken);
+    const afterDemote = await call('get', `/api/spots/${spotId}`);
+    expect(afterDemote.body.item.precise).toBeNull();
+
+    // 历史分享即时失效（下一次公开请求即 401）
+    token = '';
+    const view = await call('get', `/api/share/${ownerShareToken}`);
+    expect(view.status).toBe(401);
+    expect(view.body.error.code).toBe('SHARE_REVOKED');
+  });
+
+  it('最后一个 owner 不可降级（即使存在第二名 owner 后也保护"最后一个"）', async () => {
+    // 当前库有注册者 owner + member(已降回 member)，只有一个 owner。
+    // 提升 member 成第二个 owner，再尝试把原始 owner 自己降级到只剩一人——
+    // 更直接的红线验证：单人 owner 库禁止降级唯一 owner。
+    auth(ownerToken);
+    await call('patch', `/api/library/members/${memberId}/role`, { role: 'owner' });
+    // 把 member 降回去后，库里又只剩原始 owner
+    await call('patch', `/api/library/members/${memberId}/role`, { role: 'member' });
+    const ownerRow = (await call('get', '/api/library')).body.members.find(
+      (m: { role: string; email: string }) => m.email === 'owner@test.local',
+    ) as { id: string; role: string };
+    const last = await call('patch', `/api/library/members/${ownerRow.id}/role`, { role: 'member' });
+    expect(last.status).toBe(409);
+    expect(last.body.error.code).toBe('LAST_OWNER_PROTECTED');
+  });
+
+  it('最后一个 owner 不可移除', async () => {
+    auth(ownerToken);
+    const ownerRow = (await call('get', '/api/library')).body.members.find(
+      (m: { email: string }) => m.email === 'owner@test.local',
+    ) as { id: string };
+    const denied = await call('delete', `/api/library/members/${ownerRow.id}`);
+    expect(denied.status).toBe(409);
+    expect(denied.body.error.code).toBe('LAST_OWNER_PROTECTED');
+  });
+
+  it('移除 member：旧 token 立即失权（401），历史有效分享一并撤销', async () => {
+    auth(ownerToken);
+    const removed = await call('delete', `/api/library/members/${memberId}`);
+    expect(removed.status).toBe(200);
+
+    // 旧 JWT 立即作废：下一请求回查成员表查不到 → 401
+    auth(memberToken);
+    const afterRemove = await call('get', `/api/spots/${spotId}`);
+    expect(afterRemove.status).toBe(401);
+
+    // 该 member 之前建的分享（如成功创建过）也被撤销
+    const memberShare = (globalThis as Record<string, unknown>).__memberShareToken as string | null;
+    if (memberShare) {
+      token = '';
+      const view = await call('get', `/api/share/${memberShare}`);
+      expect(view.status).toBe(401);
+      expect(view.body.error.code).toBe('SHARE_REVOKED');
+    }
+  });
+
+  it('邀请被撤销后不可再接受（即时失效）', async () => {
+    auth(ownerToken);
+    const email2 = `invitee2-${Date.now()}@test.local`;
+    await request(app)
+      .post('/api/auth/register')
+      .send({ email: email2, password: 'password123', displayName: '第二个' });
+    const inv = await call('post', '/api/library/invites', { email: email2, role: 'member' });
+    const revoke = await call('delete', `/api/library/invites/${inv.body.id}`);
+    expect(revoke.status).toBe(200);
+
+    const t2 = (await login(email2)).token;
+    auth(t2);
+    const accept = await call('post', `/api/invites/${inv.body.token}/accept`, {});
+    expect(accept.status).toBe(410);
+    expect(accept.body.error.code).toBe('INVITE_REVOKED');
+  });
+
+  it('owner 直接按邮箱重复加成员不建双关系（兼容入口幂等）', async () => {
+    auth(ownerToken);
+    const email3 = `direct-${Date.now()}@test.local`;
+    await request(app)
+      .post('/api/auth/register')
+      .send({ email: email3, password: 'password123', displayName: '直加' });
+    const first = await call('post', '/api/library/members', { email: email3 });
+    expect(first.status).toBe(201);
+    expect(first.body.added).toBe(true);
+    const second = await call('post', '/api/library/members', { email: email3 });
+    expect(second.status).toBe(200);
+    expect(second.body.alreadyMember).toBe(true);
+    const lib = await call('get', '/api/library');
+    expect((lib.body.members as { email: string }[]).filter((m) => m.email === email3)).toHaveLength(1);
+
+    token = ownerToken;
+  });
+});
+
 describe('E10 备份与质量门', () => {
   it('可创建备份并列出', async () => {
     const backup = await call('post', '/api/backup', {});

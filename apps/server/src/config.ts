@@ -34,6 +34,7 @@ export const config = {
   weatherCacheTtlMin: Number(env('WEATHER_CACHE_TTL_MIN', '360')),
   defaultFuzzLevel: env('DEFAULT_FUZZ_LEVEL', 'g500') as FuzzLevel,
   shareMaxExpireDays: Number(env('SHARE_MAX_EXPIRE_DAYS', '180')),
+  inviteTtlDays: Number(env('INVITE_TTL_DAYS', '14')),
   enableShare: env('ENABLE_SHARE', 'true') === 'true',
   windowForecastDays: Number(env('WINDOW_FORECAST_DAYS', '7')),
   windowScanCron: env('WINDOW_SCAN_CRON', '0 * * * *'),

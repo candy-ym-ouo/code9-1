@@ -10,15 +10,86 @@ import {
   createTagSchema,
   updateTagSchema,
 } from '@flil/shared';
-import { getDb, newId, nowIso } from '../db.js';
+import { getDb, nowIso } from '../db.js';
 import { ah, ok } from '../http/respond.js';
-import { authenticate, requireOwner } from '../http/middleware.js';
+import { authenticate, requireOwner, signToken } from '../http/middleware.js';
 import { ctxOf } from '../http/context.js';
 import { buildTagTree } from '../services/serialization.js';
 import { createTag, listTags, mergeTags, suggestTags, updateTag } from '../services/tags.js';
+import {
+  acceptInvite,
+  addExistingMemberByEmail,
+  createInvite,
+  listInvites,
+  removeMember,
+  requireUsableInvite,
+  revokeInvite,
+  setMemberRole,
+} from '../services/members.js';
 import { errors } from '../http/errors.js';
 
 export const libraryRouter = Router();
+
+// ---------------------------------------------------------------------------
+// 接受 / 预览邀请：必须挂在成员回查（libraryRouter.use(authenticate())）之外，
+// 因为被邀请人此时尚不是该库成员——他自己的 JWT 指向的是自己注册时创建的库。
+// 这里仅要求"已登录"，库归属由邀请 token 自身决定。
+// ---------------------------------------------------------------------------
+
+const invitePreviewSchema = z.object({ token: z.string().min(10) });
+
+/** 接受前预览：库名、邀请角色、过期时间、当前登录邮箱是否匹配（不泄露成员关系） */
+libraryRouter.get(
+  '/invites/:token',
+  authenticate(),
+  ah(async (req, res) => {
+    const invite = requireUsableInvite(req.params.token);
+    const library = getDb()
+      .prepare('SELECT id, name FROM library WHERE id = ?')
+      .get(invite.library_id) as { id: string; name: string };
+    ok(res, {
+      libraryName: library.name,
+      role: invite.role,
+      email: invite.email,
+      expiresAt: invite.expires_at,
+      matchesCurrentUser: String(req.auth!.email).trim().toLowerCase() === invite.email,
+    });
+  }),
+);
+
+/**
+ * 接受邀请（幂等）：重复接受 / 已是成员 → alreadyJoined，不建第二条关系。
+ * 成功后签发指向目标库的新 token：前端切换会话，后续请求的精确坐标/角色按新库计算。
+ */
+libraryRouter.post(
+  '/invites/:token/accept',
+  authenticate(),
+  ah(async (req, res) => {
+    invitePreviewSchema.shape.token.parse(req.params.token);
+    const result = acceptInvite({
+      token: req.params.token,
+      userId: req.auth!.id,
+      userEmail: req.auth!.email,
+    });
+    const library = getDb()
+      .prepare('SELECT id, name, tz FROM library WHERE id = ?')
+      .get(result.libraryId) as { id: string; name: string; tz: string };
+    const user = {
+      id: req.auth!.id,
+      email: req.auth!.email,
+      displayName: req.auth!.displayName,
+      libraryId: result.libraryId,
+      role: result.role,
+    };
+    ok(res, {
+      alreadyJoined: result.alreadyJoined,
+      role: result.role,
+      library,
+      token: signToken(user),
+      user,
+    });
+  }),
+);
 
 libraryRouter.use(authenticate());
 
@@ -35,7 +106,20 @@ libraryRouter.get(
          JOIN "user" u ON u.id = m.user_id WHERE m.library_id = ?`,
       )
       .all(ctx.libraryId);
-    ok(res, { library, members });
+    // 邀请名单仅 owner 可见（含邮箱/角色，属于管理信息）
+    const invites =
+      ctx.role === 'owner'
+        ? listInvites(ctx.libraryId).map((i) => ({
+            id: i.id,
+            email: i.email,
+            role: i.role,
+            status: i.status,
+            token: i.token,
+            expiresAt: i.expires_at,
+            createdAt: i.created_at,
+          }))
+        : [];
+    ok(res, { library, members, invites });
   }),
 );
 
@@ -74,19 +158,84 @@ libraryRouter.patch(
   }),
 );
 
+// ------------------------------------------------------------ invites（owner）
+
+libraryRouter.post(
+  '/library/invites',
+  ah(async (req, res) => {
+    requireOwner(req);
+    const ctx = ctxOf(req);
+    const input = z
+      .object({
+        email: z.string().email(),
+        role: z.enum(['owner', 'member']).default('member'),
+      })
+      .parse(req.body);
+    const { invite, reused } = createInvite({
+      libraryId: ctx.libraryId,
+      email: input.email,
+      role: input.role,
+      invitedBy: req.auth!.id,
+    });
+    ok(
+      res,
+      {
+        id: invite.id,
+        email: invite.email,
+        role: invite.role,
+        token: invite.token,
+        acceptUrl: `/invite/${invite.token}`,
+        expiresAt: invite.expires_at,
+        reused,
+      },
+      reused ? 200 : 201,
+    );
+  }),
+);
+
+libraryRouter.delete(
+  '/library/invites/:id',
+  ah(async (req, res) => {
+    requireOwner(req);
+    const ctx = ctxOf(req);
+    revokeInvite(req.params.id, ctx.libraryId);
+    // 撤销即时生效：接受接口每次重读 status，下一次接受即 410
+    ok(res, { revoked: true });
+  }),
+);
+
+// ------------------------------------------------------------ members（owner）
+
+/** 兼容入口：owner 直接按邮箱把"已注册用户"加为成员（重复添加不建双关系） */
 libraryRouter.post(
   '/library/members',
   ah(async (req, res) => {
     requireOwner(req);
     const ctx = ctxOf(req);
     const input = z.object({ email: z.string().email(), role: z.enum(['member']).default('member') }).parse(req.body);
-    const db = getDb();
-    const user = db.prepare('SELECT id FROM "user" WHERE email = ?').get(input.email) as { id: string } | undefined;
-    if (!user) throw errors.notFound('该邮箱对应的用户（需先注册）');
-    db.prepare(
-      'INSERT INTO library_member (id, library_id, user_id, role, created_at) VALUES (?,?,?,?,?) ON CONFLICT (library_id, user_id) DO NOTHING',
-    ).run(newId(), ctx.libraryId, user.id, input.role, nowIso());
-    ok(res, { added: true }, 201);
+    const result = addExistingMemberByEmail({ libraryId: ctx.libraryId, email: input.email });
+    ok(
+      res,
+      { added: !result.alreadyMember, alreadyMember: result.alreadyMember, userId: result.userId },
+      result.alreadyMember ? 200 : 201,
+    );
+  }),
+);
+
+/**
+ * 角色调整。
+ * member→owner 为授权扩大；owner→member 会即时撤销其历史有效分享；
+ * 最后一个 owner 不允许降级（服务层红线）。
+ */
+libraryRouter.patch(
+  '/library/members/:userId/role',
+  ah(async (req, res) => {
+    requireOwner(req);
+    const ctx = ctxOf(req);
+    const { role } = z.object({ role: z.enum(['owner', 'member']) }).parse(req.body);
+    const result = setMemberRole({ libraryId: ctx.libraryId, targetUserId: req.params.userId, role });
+    // 角色即时生效：被调整者的下一个请求由鉴权回查到新 role，精确坐标/分享能力立刻变化
+    ok(res, { role, ...result });
   }),
 );
 
@@ -95,13 +244,9 @@ libraryRouter.delete(
   ah(async (req, res) => {
     requireOwner(req);
     const ctx = ctxOf(req);
-    const target = getDb()
-      .prepare('SELECT role FROM library_member WHERE library_id = ? AND user_id = ?')
-      .get(ctx.libraryId, req.params.userId) as { role: string } | undefined;
-    if (!target) throw errors.notFound('成员');
-    if (target.role === 'owner') throw errors.badRequest('不能移除所有者');
-    getDb().prepare('DELETE FROM library_member WHERE library_id = ? AND user_id = ?').run(ctx.libraryId, req.params.userId);
-    ok(res, { removed: true });
+    // 最后一个 owner 不可移除；移除即时作废其旧 token（鉴权回查）与历史分享
+    const result = removeMember(ctx.libraryId, req.params.userId);
+    ok(res, { removed: true, ...result });
   }),
 );
 

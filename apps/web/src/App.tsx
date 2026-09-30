@@ -16,6 +16,7 @@ import Places from './routes/Places.js';
 import Plans from './routes/Plans.js';
 import Settings from './routes/Settings.js';
 import ShareView from './routes/ShareView.js';
+import InviteAccept from './routes/InviteAccept.js';
 
 const { Header, Sider, Content } = Layout;
 
@@ -97,6 +98,7 @@ export default function App() {
     <Routes>
       <Route path="/login" element={<Login />} />
       <Route path="/share/:token" element={<ShareView />} />
+      <Route path="/invite/:token" element={<InviteAccept />} />
       <Route
         path="*"
         element={

@@ -327,3 +327,69 @@ export function useRevokeShare() {
     onSuccess: () => void qc.invalidateQueries({ queryKey: ['shareLinks'] }),
   });
 }
+
+// ------------------------------------------------------------- members / invites
+
+export interface LibraryMember {
+  id: string;
+  email: string;
+  displayName: string;
+  role: 'owner' | 'member';
+}
+
+export interface LibraryInvite {
+  id: string;
+  email: string;
+  role: 'owner' | 'member';
+  status: 'pending' | 'accepted' | 'revoked' | 'expired';
+  token: string;
+  expiresAt: string;
+  createdAt: string;
+}
+
+export interface LibraryInfoResponse {
+  library: { id: string; name: string; tz: string; defaultFuzzLevel: string; created_at?: string };
+  members: LibraryMember[];
+  invites: LibraryInvite[];
+}
+
+export const useLibraryInfo = () =>
+  useQuery({ queryKey: ['library'], queryFn: () => get<LibraryInfoResponse>('/library') });
+
+export function useInviteMember() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: { email: string; role: 'owner' | 'member' }) =>
+      post<{ token: string; acceptUrl: string; expiresAt: string; reused: boolean }>(
+        '/library/invites',
+        body,
+      ),
+    onSuccess: () => void qc.invalidateQueries({ queryKey: ['library'] }),
+  });
+}
+
+export function useRevokeInvite() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => del<unknown>(`/library/invites/${id}`),
+    onSuccess: () => void qc.invalidateQueries({ queryKey: ['library'] }),
+  });
+}
+
+export function useSetMemberRole() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (vars: { userId: string; role: 'owner' | 'member' }) =>
+      patch<{ revokedShareCount: number }>(`/library/members/${vars.userId}/role`, { role: vars.role }),
+    onSuccess: () => void qc.invalidateQueries({ queryKey: ['library'] }),
+  });
+}
+
+export function useRemoveMember() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (userId: string) =>
+      del<{ removed: boolean; revokedShareCount: number }>(`/library/members/${userId}`),
+    onSuccess: () => void qc.invalidateQueries({ queryKey: ['library'] }),
+  });
+}
