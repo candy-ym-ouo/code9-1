@@ -28,6 +28,15 @@ export const errors = {
   shareExpired: () => new ApiError('SHARE_EXPIRED', 401, '分享链接已过期'),
   shareRevoked: () => new ApiError('SHARE_REVOKED', 401, '分享链接已撤销'),
   sharePasswordRequired: () => new ApiError('SHARE_PASSWORD_REQUIRED', 401, '需要访问密码'),
+  invitationInvalid: () => new ApiError('INVITATION_INVALID', 404, '邀请链接不存在'),
+  invitationExpired: () => new ApiError('INVITATION_EXPIRED', 410, '邀请已过期'),
+  invitationNotPending: (detail = '邀请已被使用或撤销') =>
+    new ApiError('INVITATION_NOT_PENDING', 410, detail),
+  invitationEmailMismatch: () =>
+    new ApiError('INVITATION_EMAIL_MISMATCH', 403, '该邀请不属于当前登录的账号，请用受邀邮箱登录'),
+  invitationAlreadyMember: () => new ApiError('INVITATION_ALREADY_MEMBER', 409, '该用户已经是库成员'),
+  lastOwner: (detail = '库必须保留至少一名所有者，最后所有者不可移除或降级') =>
+    new ApiError('LAST_OWNER', 409, detail),
   badRequest: (message: string, details?: Record<string, unknown>) =>
     new ApiError('BAD_REQUEST', 400, message, details),
 };

@@ -10,12 +10,20 @@ import {
   createTagSchema,
   updateTagSchema,
 } from '@flil/shared';
-import { getDb, newId, nowIso } from '../db.js';
+import { getDb, nowIso } from '../db.js';
 import { ah, ok } from '../http/respond.js';
-import { authenticate, requireOwner } from '../http/middleware.js';
+import { authenticate, currentUser, requireOwner } from '../http/middleware.js';
 import { ctxOf } from '../http/context.js';
 import { buildTagTree } from '../services/serialization.js';
 import { createTag, listTags, mergeTags, suggestTags, updateTag } from '../services/tags.js';
+import {
+  addExistingUserAsMember,
+  createInvitation,
+  listInvitations,
+  removeMember,
+  revokeInvitation,
+  setMemberRole,
+} from '../services/members.js';
 import { errors } from '../http/errors.js';
 
 export const libraryRouter = Router();
@@ -31,11 +39,24 @@ libraryRouter.get(
       .get(ctx.libraryId);
     const members = getDb()
       .prepare(
-        `SELECT m.role, u.id, u.email, u.display_name FROM library_member m
-         JOIN "user" u ON u.id = m.user_id WHERE m.library_id = ?`,
+        `SELECT m.role, m.created_at, u.id, u.email, u.display_name FROM library_member m
+         JOIN "user" u ON u.id = m.user_id WHERE m.library_id = ?
+         ORDER BY m.role = 'owner' DESC, m.created_at ASC`,
       )
       .all(ctx.libraryId);
-    ok(res, { library, members });
+    // 邀请列表仅对 owner 暴露（协作者无需看到待入成员的邮箱）
+    const invitations =
+      currentUser(req).role === 'owner'
+        ? listInvitations(ctx.libraryId).map((i) => ({
+            id: i.id,
+            email: i.email,
+            role: i.role,
+            status: i.status,
+            expiresAt: i.expires_at,
+            createdAt: i.created_at,
+          }))
+        : [];
+    ok(res, { library, members, invitations });
   }),
 );
 
@@ -74,34 +95,92 @@ libraryRouter.patch(
   }),
 );
 
+// ------------------------------------------------------------ 邀请与成员
+
+const invitationCreateSchema = z.object({
+  email: z.string().email(),
+  role: z.enum(['owner', 'member']).default('member'),
+  expiresInDays: z.number().int().min(1).max(180).optional(),
+});
+
+/**
+ * 创建邀请。明文令牌只在响应中出现一次（库存哈希），调用方负责转给受邀人。
+ * 重发同一邮箱：旧待接受邀请被顶替（replaced），旧令牌即时失效，不产生两条待处理邀请。
+ */
+libraryRouter.post(
+  '/library/invitations',
+  ah(async (req, res) => {
+    requireOwner(req);
+    const ctx = ctxOf(req);
+    const input = invitationCreateSchema.parse(req.body);
+    const created = createInvitation({
+      libraryId: ctx.libraryId,
+      email: input.email,
+      role: input.role,
+      invitedBy: currentUser(req).id,
+      expiresInDays: input.expiresInDays,
+    });
+    ok(
+      res,
+      {
+        id: created.row.id,
+        email: created.row.email,
+        role: created.row.role,
+        status: created.row.status,
+        expiresAt: created.row.expires_at,
+        url: `/accept-invite/${created.token}`,
+        token: created.token,
+        replaced: created.replaced,
+      },
+      201,
+    );
+  }),
+);
+
+/** 撤销邀请：旧令牌立即不可用 */
+libraryRouter.post(
+  '/library/invitations/:id/revoke',
+  ah(async (req, res) => {
+    requireOwner(req);
+    const ctx = ctxOf(req);
+    revokeInvitation(req.params.id, ctx.libraryId);
+    ok(res, { revoked: true });
+  }),
+);
+
+/** 调整成员角色（owner ↔ member）；降级最后所有者被拒，变更即时生效 */
+libraryRouter.patch(
+  '/library/members/:userId/role',
+  ah(async (req, res) => {
+    requireOwner(req);
+    const ctx = ctxOf(req);
+    const { role } = z.object({ role: z.enum(['owner', 'member']) }).parse(req.body);
+    const result = setMemberRole(ctx.libraryId, req.params.userId, role);
+    ok(res, { updated: result.changed, role, revokedShares: result.revokedShares });
+  }),
+);
+
 libraryRouter.post(
   '/library/members',
   ah(async (req, res) => {
     requireOwner(req);
     const ctx = ctxOf(req);
+    // 兼容旧用法：直接把已注册用户加入库（新流程应走 /library/invitations）。
+    // 成员关系有 UNIQUE 约束：重复加入不会建双关系。
     const input = z.object({ email: z.string().email(), role: z.enum(['member']).default('member') }).parse(req.body);
-    const db = getDb();
-    const user = db.prepare('SELECT id FROM "user" WHERE email = ?').get(input.email) as { id: string } | undefined;
-    if (!user) throw errors.notFound('该邮箱对应的用户（需先注册）');
-    db.prepare(
-      'INSERT INTO library_member (id, library_id, user_id, role, created_at) VALUES (?,?,?,?,?) ON CONFLICT (library_id, user_id) DO NOTHING',
-    ).run(newId(), ctx.libraryId, user.id, input.role, nowIso());
-    ok(res, { added: true }, 201);
+    const result = addExistingUserAsMember(ctx.libraryId, input.email, input.role);
+    ok(res, { added: result.added }, 201);
   }),
 );
 
+/** 移除成员：owner 不可移除；其历史分享链接同步即时撤销，旧 JWT 下次请求即 401 */
 libraryRouter.delete(
   '/library/members/:userId',
   ah(async (req, res) => {
     requireOwner(req);
     const ctx = ctxOf(req);
-    const target = getDb()
-      .prepare('SELECT role FROM library_member WHERE library_id = ? AND user_id = ?')
-      .get(ctx.libraryId, req.params.userId) as { role: string } | undefined;
-    if (!target) throw errors.notFound('成员');
-    if (target.role === 'owner') throw errors.badRequest('不能移除所有者');
-    getDb().prepare('DELETE FROM library_member WHERE library_id = ? AND user_id = ?').run(ctx.libraryId, req.params.userId);
-    ok(res, { removed: true });
+    const result = removeMember(ctx.libraryId, req.params.userId);
+    ok(res, { removed: true, revokedShares: result.revokedShares });
   }),
 );
 

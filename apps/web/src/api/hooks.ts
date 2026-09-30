@@ -327,3 +327,87 @@ export function useRevokeShare() {
     onSuccess: () => void qc.invalidateQueries({ queryKey: ['shareLinks'] }),
   });
 }
+
+// ---------------------------------------------------------------- 成员与邀请
+
+export interface LibraryMember {
+  id: string;
+  email: string;
+  displayName: string;
+  role: 'owner' | 'member';
+  created_at?: string;
+}
+
+export interface LibraryInvitation {
+  id: string;
+  email: string;
+  role: 'owner' | 'member';
+  status: 'pending' | 'accepted' | 'revoked' | 'replaced';
+  expiresAt: string;
+  createdAt: string;
+}
+
+export interface LibraryInfo {
+  library: { id: string; name: string; tz: string; defaultFuzzLevel: string };
+  members: LibraryMember[];
+  invitations: LibraryInvitation[];
+}
+
+export const useLibrary = () => useQuery({ queryKey: ['library'], queryFn: () => get<LibraryInfo>('/library') });
+
+export const useMyInvitations = () =>
+  useQuery({
+    queryKey: ['my-invitations'],
+    queryFn: () =>
+      get<{
+        items: {
+          id: string;
+          email: string;
+          role: 'owner' | 'member';
+          libraryName: string;
+          expiresAt: string;
+          createdAt: string;
+        }[];
+      }>('/auth/invitations'),
+  });
+
+export function useMemberActions() {
+  const qc = useQueryClient();
+  const invalidate = () => void qc.invalidateQueries({ queryKey: ['library'] });
+  return {
+    createInvitation: useMutation({
+      mutationFn: (body: { email: string; role?: 'owner' | 'member'; expiresInDays?: number }) =>
+        post<{ id: string; token: string; url: string; replaced: boolean }>('/library/invitations', body),
+      onSuccess: invalidate,
+    }),
+    revokeInvitation: useMutation({
+      mutationFn: (id: string) => post<unknown>(`/library/invitations/${id}/revoke`, {}),
+      onSuccess: invalidate,
+    }),
+    setRole: useMutation({
+      mutationFn: ({ userId, role }: { userId: string; role: 'owner' | 'member' }) =>
+        patch<{ updated: boolean; revokedShares: number }>(`/library/members/${userId}/role`, { role }),
+      onSuccess: invalidate,
+    }),
+    remove: useMutation({
+      mutationFn: (userId: string) => del<{ removed: boolean; revokedShares: number }>(`/library/members/${userId}`),
+      onSuccess: invalidate,
+    }),
+  };
+}
+
+export function useAcceptInvitation() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (token: string) =>
+      post<{
+        token: string;
+        already: boolean;
+        user: import('@flil/shared').AuthUser;
+        library: { id: string; name: string; tz: string };
+      }>(`/auth/invitations/${token}/accept`, {}),
+    onSuccess: () => {
+      void qc.invalidateQueries();
+    },
+  });
+}

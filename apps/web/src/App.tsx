@@ -1,10 +1,11 @@
 import { useEffect } from 'react';
 import { Link, Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
-import { Badge, Button, Layout, Menu, Space, Tag, Typography } from 'antd';
+import { Alert, Badge, Button, Layout, Menu, Space, Tag, Typography } from 'antd';
 import { get } from './api/client.js';
-import { useReminders } from './api/hooks.js';
+import { useMyInvitations, useReminders } from './api/hooks.js';
 import { useSession } from './stores/session.js';
 import Login from './routes/Login.js';
+import AcceptInvite from './routes/AcceptInvite.js';
 import Today from './routes/Today.js';
 import Inbox from './routes/Inbox.js';
 import Inspirations from './routes/Inspirations.js';
@@ -18,6 +19,21 @@ import Settings from './routes/Settings.js';
 import ShareView from './routes/ShareView.js';
 
 const { Header, Sider, Content } = Layout;
+
+function InviteBanner() {
+  const { data } = useMyInvitations();
+  const items = data?.items ?? [];
+  if (items.length === 0) return null;
+  return (
+    <Alert
+      style={{ marginBottom: 12 }}
+      type="info"
+      showIcon
+      message={`你有 ${items.length} 条待接受的库邀请：${items.map((i) => i.libraryName).join('、')}`}
+      description="邀请链接只在邀请邮件/消息里，打开后点击接受即可切换到对应库。"
+    />
+  );
+}
 
 function Shell({ children }: { children: React.ReactNode }) {
   const { user, libraryTz, setLibraryTz, clear } = useSession();
@@ -86,7 +102,10 @@ function Shell({ children }: { children: React.ReactNode }) {
         <Sider width={150} theme="light">
           <Menu mode="inline" selectedKeys={selected} items={items} style={{ height: '100%', borderRight: 0 }} />
         </Sider>
-        <Content style={{ padding: 20, background: '#f5f7f8' }}>{children}</Content>
+        <Content style={{ padding: 20, background: '#f5f7f8' }}>
+          <InviteBanner />
+          {children}
+        </Content>
       </Layout>
     </Layout>
   );
@@ -96,6 +115,7 @@ export default function App() {
   return (
     <Routes>
       <Route path="/login" element={<Login />} />
+      <Route path="/accept-invite/:token" element={<AcceptInvite />} />
       <Route path="/share/:token" element={<ShareView />} />
       <Route
         path="*"

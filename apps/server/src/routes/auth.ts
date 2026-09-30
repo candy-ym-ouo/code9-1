@@ -7,6 +7,7 @@ import { errors } from '../http/errors.js';
 import { ah, ok } from '../http/respond.js';
 import { authenticate, rateLimit, signToken } from '../http/middleware.js';
 import { ensureBaselineTags } from '../seed/baseline.js';
+import { acceptInvitation, listPendingInvitationsForUser } from '../services/members.js';
 
 export const authRouter = Router();
 
@@ -71,8 +72,9 @@ authRouter.post(
     if (!row || !bcrypt.compareSync(input.password, row.password_hash)) {
       throw errors.authRequired();
     }
+    // 单一活动库语义：取最近加入的成员关系（接受邀请加入的库排在自建库之后）
     const member = db
-      .prepare('SELECT library_id, role FROM library_member WHERE user_id = ? LIMIT 1')
+      .prepare('SELECT library_id, role FROM library_member WHERE user_id = ? ORDER BY created_at DESC LIMIT 1')
       .get(row.id) as { library_id: string; role: 'owner' | 'member' } | undefined;
     if (!member) throw errors.notFound('库');
 
@@ -96,6 +98,59 @@ authRouter.get(
       .prepare('SELECT id, name, tz, default_fuzz_level FROM library WHERE id = ?')
       .get(user.libraryId);
     ok(res, { user, library });
+  }),
+);
+
+/** 当前用户的待处理邀请（登录后横幅提示用） */
+authRouter.get(
+  '/auth/invitations',
+  authenticate(),
+  ah(async (req, res) => {
+    const user = req.auth as AuthUser;
+    ok(res, {
+      items: listPendingInvitationsForUser(user.id, user.email).map((i) => ({
+        id: i.id,
+        email: i.email,
+        role: i.role,
+        libraryName: i.library_name,
+        expiresAt: i.expires_at,
+        createdAt: i.created_at,
+      })),
+    });
+  }),
+);
+
+/**
+ * 接受邀请（需登录）。
+ * - 仅受邀邮箱本人可接受（防令牌转交）；
+ * - 重复接受幂等：已是成员则不建双关系，返回 already:true；
+ * - 成功后签发指向受邀库的新 token，角色/精确坐标权限当场切换。
+ */
+authRouter.post(
+  '/auth/invitations/:token/accept',
+  rateLimit('invite-accept', 20, 60000),
+  authenticate(),
+  ah(async (req, res) => {
+    const current = req.auth as AuthUser;
+    const result = acceptInvitation(req.params.token, { id: current.id, email: current.email });
+    const libraryRow = getDb()
+      .prepare('SELECT id, name, tz FROM library WHERE id = ?')
+      .get(result.invitation.library_id) as { id: string; name: string; tz: string } | undefined;
+    if (!libraryRow) throw errors.notFound('库');
+
+    const user: AuthUser = {
+      id: current.id,
+      email: current.email,
+      displayName: current.displayName,
+      libraryId: libraryRow.id,
+      role: result.role,
+    };
+    ok(res, {
+      token: signToken(user),
+      user,
+      library: libraryRow,
+      already: result.already,
+    });
   }),
 );
 

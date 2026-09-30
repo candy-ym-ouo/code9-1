@@ -112,6 +112,21 @@ export function listShareLinks(libraryId: string): ShareLinkRow[] {
     .all(libraryId) as ShareLinkRow[];
 }
 
+/**
+ * 成员/角色变更的即时失效钩子：把某人创建的、仍有效的分享链接全部撤销。
+ * 分享页与图片令牌每次请求都现查 revoked_at，因此撤销在下一次请求立即生效；
+ * 返回撤销条数供接口回显（"本次同步关闭了 N 个历史口子"）。
+ */
+export function revokeShareLinksByCreator(libraryId: string, userId: string): number {
+  const res = getDb()
+    .prepare(
+      `UPDATE share_link SET revoked_at = ?
+       WHERE library_id = ? AND created_by = ? AND revoked_at IS NULL AND expires_at > ?`,
+    )
+    .run(nowIso(), libraryId, userId, nowIso());
+  return res.changes;
+}
+
 export function shareStatus(link: ShareLinkRow): 'active' | 'expired' | 'revoked' {
   if (link.revoked_at) return 'revoked';
   if (new Date(link.expires_at).getTime() < Date.now()) return 'expired';

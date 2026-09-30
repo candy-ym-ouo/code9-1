@@ -7,6 +7,8 @@ import {
   Descriptions,
   Form,
   Input,
+  Modal,
+  Popconfirm,
   Select,
   Space,
   Table,
@@ -16,9 +18,228 @@ import {
   message,
 } from 'antd';
 import { get, patch, post } from '../api/client.js';
-import { useReminders, useRevokeShare, useShareLinks, useTags } from '../api/hooks.js';
+import {
+  useLibrary,
+  useMemberActions,
+  useReminders,
+  useRevokeShare,
+  useShareLinks,
+  useTags,
+} from '../api/hooks.js';
 import { FUZZ_LABEL, fmtDateTime } from '../lib/format.js';
 import { useSession } from '../stores/session.js';
+
+function MembersPanel() {
+  const qc = useQueryClient();
+  const session = useSession();
+  const { data } = useLibrary();
+  const actions = useMemberActions();
+  const [email, setEmail] = useState('');
+  const [role, setRole] = useState<'owner' | 'member'>('member');
+  const [sending, setSending] = useState(false);
+  const isOwner = session.user?.role === 'owner';
+
+  const members = data?.members ?? [];
+  const ownerCount = members.filter((m) => m.role === 'owner').length;
+
+  async function sendInvite() {
+    if (!email.trim()) return;
+    setSending(true);
+    try {
+      const res = await actions.createInvitation.mutateAsync({ email: email.trim(), role });
+      Modal.success({
+        title: res.replaced ? '已重发邀请（旧链接即时失效）' : '邀请已创建',
+        content: (
+          <Space direction="vertical" style={{ marginTop: 8 }}>
+            <Typography.Text>把下面的链接发给受邀人（仅显示这一次，请立即复制）：</Typography.Text>
+            <Typography.Text copyable code style={{ wordBreak: 'break-all' }}>
+              {`${window.location.origin}${res.url}`}
+            </Typography.Text>
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              受邀人需用对应邮箱登录后打开；接受即加入库，重复接受不会产生重复关系。
+            </Typography.Text>
+          </Space>
+        ),
+        width: 560,
+      });
+      setEmail('');
+    } catch (err) {
+      message.error((err as Error).message);
+    } finally {
+      setSending(false);
+    }
+  }
+
+  async function changeRole(userId: string, next: 'owner' | 'member') {
+    try {
+      const res = await actions.setRole.mutateAsync({ userId, role: next });
+      await qc.invalidateQueries();
+      message.success(
+        res.updated
+          ? `角色已调整，即时生效${res.revokedShares > 0 ? `；其 ${res.revokedShares} 条历史分享已同步撤销` : ''}`
+          : '角色未变化',
+      );
+    } catch (err) {
+      message.error((err as Error).message);
+    }
+  }
+
+  async function remove(userId: string) {
+    try {
+      const res = await actions.remove.mutateAsync(userId);
+      await qc.invalidateQueries();
+      message.success(`成员已移除，访问权即时失效${res.revokedShares > 0 ? `；其 ${res.revokedShares} 条历史分享已撤销` : ''}`);
+    } catch (err) {
+      message.error((err as Error).message);
+    }
+  }
+
+  return (
+    <Space direction="vertical" style={{ width: '100%' }} size={16}>
+      <Card title="成员" extra={<Typography.Text type="secondary" style={{ fontSize: 12 }}>
+        所有者 {ownerCount} 名；库必须至少保留一名所有者
+      </Typography.Text>}>
+        <Table
+          size="small"
+          rowKey="id"
+          pagination={false}
+          dataSource={members}
+          columns={[
+            { title: '昵称', dataIndex: 'displayName' },
+            { title: '邮箱', dataIndex: 'email' },
+            {
+              title: '角色',
+              dataIndex: 'role',
+              width: 100,
+              render: (v: string) => (v === 'owner' ? <Tag color="gold">所有者</Tag> : <Tag>协作者</Tag>),
+            },
+            ...(isOwner
+              ? [
+                  {
+                    title: '操作',
+                    width: 220,
+                    render: (_: unknown, m: { id: string; email: string; role: string }) => {
+                      const self = m.id === session.user?.id;
+                      const isLastOwner = m.role === 'owner' && ownerCount <= 1;
+                      return (
+                        <Space>
+                          {m.role === 'member' ? (
+                            <Button size="small" onClick={() => changeRole(m.id, 'owner')}>
+                              设为所有者
+                            </Button>
+                          ) : (
+                            <Button size="small" disabled={isLastOwner} onClick={() => changeRole(m.id, 'member')}>
+                              降为协作者
+                            </Button>
+                          )}
+                          <Popconfirm
+                            title={m.role === 'owner' ? '所有者不能直接移除，请先降级' : `移除 ${m.email}？`}
+                            description={m.role === 'owner' ? undefined : '其访问权与历史分享链接将立即失效'}
+                            okText="移除"
+                            okButtonProps={{ danger: true }}
+                            disabled={m.role === 'owner'}
+                            onConfirm={() => remove(m.id)}
+                          >
+                            <Button size="small" danger disabled={m.role === 'owner'}>
+                              {self ? '退出' : '移除'}
+                            </Button>
+                          </Popconfirm>
+                        </Space>
+                      );
+                    },
+                  },
+                ]
+              : []),
+          ]}
+        />
+        {!isOwner ? <Alert style={{ marginTop: 12 }} type="info" showIcon message="仅所有者可邀请成员与调整角色。" /> : null}
+      </Card>
+
+      {isOwner ? (
+        <Card title="邀请新成员">
+          <Space wrap>
+            <Input
+              placeholder="受邀人注册邮箱"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              style={{ width: 260 }}
+            />
+            <Select
+              value={role}
+              onChange={setRole}
+              style={{ width: 140 }}
+              options={[
+                { value: 'member', label: '协作者' },
+                { value: 'owner', label: '所有者' },
+              ]}
+            />
+            <Button type="primary" loading={sending} onClick={sendInvite}>
+              生成邀请链接
+            </Button>
+          </Space>
+
+          <Table
+            style={{ marginTop: 16 }}
+            size="small"
+            rowKey="id"
+            pagination={false}
+            dataSource={data?.invitations ?? []}
+            columns={[
+              { title: '邮箱', dataIndex: 'email' },
+              {
+                title: '角色',
+                dataIndex: 'role',
+                width: 90,
+                render: (v: string) => (v === 'owner' ? <Tag color="gold">所有者</Tag> : <Tag>协作者</Tag>),
+              },
+              {
+                title: '状态',
+                dataIndex: 'status',
+                width: 100,
+                render: (v: string) => {
+                  const map: Record<string, { color: string; text: string }> = {
+                    pending: { color: 'blue', text: '待接受' },
+                    accepted: { color: 'green', text: '已接受' },
+                    revoked: { color: 'red', text: '已撤销' },
+                    replaced: { color: 'default', text: '已重发' },
+                  };
+                  const s = map[v] ?? { color: 'default', text: v };
+                  return <Tag color={s.color}>{s.text}</Tag>;
+                },
+              },
+              { title: '过期时间', dataIndex: 'expiresAt', width: 200, render: (v: string) => fmtDateTime(v, session.libraryTz) },
+              {
+                title: '操作',
+                width: 90,
+                render: (_: unknown, r: { id: string; status: string }) =>
+                  r.status === 'pending' ? (
+                    <Button
+                      size="small"
+                      danger
+                      onClick={async () => {
+                        await actions.revokeInvitation.mutateAsync(r.id);
+                        message.success('邀请已撤销，旧链接即时失效');
+                      }}
+                    >
+                      撤销
+                    </Button>
+                  ) : (
+                    <Typography.Text type="secondary">—</Typography.Text>
+                  ),
+              },
+            ]}
+          />
+          <Alert
+            style={{ marginTop: 12 }}
+            type="warning"
+            showIcon
+            message="角色调整或移除成员会即时生效：旧登录凭证下次请求即失效，当事人创建的历史分享链接（含图片令牌）同步撤销。"
+          />
+        </Card>
+      ) : null}
+    </Space>
+  );
+}
 
 export default function Settings() {
   const qc = useQueryClient();
@@ -48,6 +269,11 @@ export default function Settings() {
   return (
     <Tabs
       items={[
+        {
+          key: 'members',
+          label: '成员与邀请',
+          children: <MembersPanel />,
+        },
         {
           key: 'library',
           label: '库设置',

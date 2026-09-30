@@ -10,6 +10,8 @@ interface SessionState {
   libraryTz: string;
   setSession: (token: string, user: AuthUser) => void;
   setLibraryTz: (tz: string) => void;
+  /** 接受邀请后用换发的凭证原地切换活动库，不丢本地其他状态 */
+  switchSession: (token: string, user: AuthUser) => void;
   clear: () => void;
 }
 
@@ -31,6 +33,11 @@ export const useSession = create<SessionState>((set) => ({
     set({ token, user });
   },
   setLibraryTz: (tz) => set({ libraryTz: tz }),
+  switchSession: (token, user) => {
+    localStorage.setItem(TOKEN_KEY, token);
+    localStorage.setItem(USER_KEY, JSON.stringify(user));
+    set({ token, user });
+  },
   clear: () => {
     localStorage.removeItem(TOKEN_KEY);
     localStorage.removeItem(USER_KEY);
